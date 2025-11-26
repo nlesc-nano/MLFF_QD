@@ -89,7 +89,7 @@ We are showing examples with nequip, you can choose anyone. **The training proce
 | Use engine-specific YAML with `--engine` | `sbatch run_idv.sh nequip.yaml --engine nequip` | YAML must contain `input_xyz_file` |
 | Override input in engine-specific YAML | `sbatch run_idv.sh nequip.yaml --engine nequip --input ./basic.xyz` | Use to test with alternate datasets |
 
-## Additional Flags: `--only-generate` and `--train-after-generate`
+## Mandatory Flags: `--only-generate` and `--train-after-generate`
 
 Control **data/config generation** and **training** phases using these flags:
 - `--only-generate`:  

@@ -1,23 +1,18 @@
-# uq_metrics_calculator.py
 """Uncertainty‑quantification metrics **calculator – 2025 refactor**
 
-This file exposes **one public entry‑point** – :func:`run_uq_metrics` – that
-covers everything the former 2 000‑line implementation did while being
-readable and unit‑testable.  Legacy code that still calls
-``calculate_uq_metrics`` keeps working thanks to a shim at the bottom.
+Patched version: adds an optional `calibrators` argument to
+`run_uq_metrics` so a calibrator fitted on *train* can be applied to *eval*.
+Also fixes the isotonic calibration units mismatch by converting the
+predicted E[|\u03b4|] into an equivalent sigma under the Gaussian
+relationship E|\u03b4| = sigma * sqrt(2/pi).
 
---------------------------------------------------------------------------
-API
----
-.. autofunction:: run_uq_metrics
-.. autofunction:: calculate_uq_metrics  (compat)
---------------------------------------------------------------------------
+This file is a full drop‑in replacement for the original module.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import logging
 
 import numpy as np
@@ -58,55 +53,75 @@ class VarianceScalingCalibrator:
 
     # pylint: disable=invalid-name
     @staticmethod
-    def _closed_form_s(delta: np.ndarray, sigma: np.ndarray) -> float:
-        return float(np.sqrt(np.nanmean((delta ** 2) / (sigma ** 2))))
+    def _closed_form_s(delta, sigma):
+        s_arr = (delta ** 2) / (_safe_sigma(sigma) ** 2)
+        # remove extreme top 1% before mean
+        s_arr = s_arr[np.isfinite(s_arr)]
+        if len(s_arr) == 0:
+            return 1.0
+        s_arr = np.sort(s_arr)
+        trim = int(len(s_arr) * 0.01)
+        if trim > 0:
+            s_arr = s_arr[:-trim]
+        return float(np.sqrt(np.mean(s_arr)))
 
     def fit(self, delta: np.ndarray, sigma: np.ndarray) -> "VarianceScalingCalibrator":
         self.s = self._closed_form_s(delta, sigma)
         return self
 
     def transform(self, sigma: np.ndarray) -> np.ndarray:
-        return self.s * sigma
+        return self.s * _safe_sigma(sigma)
 
     # convenience ----------------------------------------------------------
     def fit_transform(self, delta: np.ndarray, sigma: np.ndarray) -> np.ndarray:
         self.fit(delta, sigma)
         return self.transform(sigma)
 
+
 class IsotonicCalibrator:
-    """Non-parametric monotonic calibration σ' = f(σ).
+    """Non‑parametric monotonic calibration σ' = f(σ).
 
     Learns a monotone mapping so that the *z*-scores follow 𝓝(0,1)
-    (i.e. E[|δ|] ≈ σ').  Works even when the ensemble residuals are
-    non-Gaussian or heteroscedastic.
+    by fitting the expected absolute error E[|δ|] as a function of the
+    input sigma and **converting it back to an equivalent σ** using the
+    Gaussian relation E|δ| = σ * sqrt(2/π).
 
     Notes
     -----
     • The target we fit is |δ| (absolute error).
-    • We force the mapping through the origin and keep it non-decreasing.
+    • We force the mapping through the origin and keep it non‑decreasing.
     """
 
     def __init__(self) -> None:
         self._iso = IsotonicRegression(y_min=0.0, increasing=True, out_of_bounds="clip")
+        # constant to convert E|δ| → σ under Gaussian assumption
+        from math import sqrt, pi
+
+        self._abs_to_sigma = float(sqrt(2.0 / pi))
 
     def fit(self, delta: np.ndarray, sigma: np.ndarray) -> "IsotonicCalibrator":
         abs_delta = np.abs(delta)
-        sigma = _safe_sigma(sigma)           # reuse helper from your module
-        # sort by sigma to satisfy isotonic-regression requirements
+        sigma = _safe_sigma(sigma)
         idx = np.argsort(sigma)
         self._iso.fit(sigma[idx], abs_delta[idx])
         return self
 
     def transform(self, sigma: np.ndarray) -> np.ndarray:
-        return self._iso.predict(_safe_sigma(sigma))
+        # predict expected |delta| then convert to sigma units
+        pred_abs = self._iso.predict(_safe_sigma(sigma))
+        # avoid divide-by-zero; convert using Gaussian formula
+        sigma_pred = pred_abs / self._abs_to_sigma
+        return _safe_sigma(sigma_pred)
 
     # convenience ----------------------------------------------------------
     def fit_transform(self, delta: np.ndarray, sigma: np.ndarray) -> np.ndarray:
         self.fit(delta, sigma)
         return self.transform(sigma)
 
+
 # ---- Metric primitives -----------------------------------------------------
 _EPS = 1e-12
+
 
 def _safe_sigma(sigma: np.ndarray) -> np.ndarray:
     """Clamp too‑small σ to avoid /0 and log(0)."""
@@ -166,6 +181,8 @@ def ence(delta: np.ndarray, sigma: np.ndarray, *, bins: int = 10) -> float:
         rmv.append(np.sqrt(np.mean(sigma_sorted[s] ** 2)))
         rmse.append(np.sqrt(np.mean(delta_sorted[s] ** 2)))
     rmv, rmse = np.asarray(rmv), np.asarray(rmse)
+    # guard against tiny rmv
+    rmv = np.where(rmv < _EPS, _EPS, rmv)
     return float(np.mean(np.abs(rmv - rmse) / rmv))
 
 
@@ -224,27 +241,34 @@ def student_t_nll(y, mu, sigma, nu=3.0):
         + gammaln(0.5 * (nu + 1)) - gammaln(0.5 * nu)
         + 0.5 * (nu + 1) * np.log(1 + (z**2) / nu)
     )
+
 def mean_student_t_nll(y, mu, sigma, nu=3.0):
     return float(np.nanmean(student_t_nll(y, mu, sigma, nu)))
 
 from textwrap import indent
 
+
 def verdict_short(v):
     return {'good': 'G', 'average': 'A', 'poor': 'P'}.get(v, '-')
 
-def pretty_table_full(row_names, col_names, table, verdicts):
-    col_w = max(8, max(len(c) for c in col_names))
-    header = "│".join([f"{'Metric':<{col_w}}"] + [f"{c:^{col_w+7}}" for c in col_names])
-    lines = [header, "─" * (col_w + (col_w+8) * len(col_names))]
-    for i, name in enumerate(row_names):
-        vals = [
-            f"{table[i][j]:10.4f} [{verdict_short(verdicts[i][j])}]"
-            for j in range(len(col_names))
-        ]
-        lines.append("│".join([f"{name:<{col_w}}"] + vals))
+
+def pretty_table_full(metric_groups, col_names, verdicts):
+    col_w = max(10, max(len(c) for c in col_names))
+    header = "│".join([f"{'Metric':<16}"] + [f"{c:^{col_w+7}}" for c in col_names])
+    lines = [header, "─" * (16 + (col_w+8) * len(col_names))]
+    
+    for group_name, row_names, table_data in metric_groups:
+        lines.append(f"  [{group_name}]")
+        for i, name in enumerate(row_names):
+            vals = [
+                f"{table_data[i][j]:10.4f} [{verdict_short(verdicts[name][j])}]"
+                for j in range(len(col_names))
+            ]
+            lines.append("│".join([f"{name:<16}"] + vals))
+        lines.append("─" * (16 + (col_w+8) * len(col_names)))
     return indent("\n".join(lines), "   ")
 
-# Thresholds and verdict logic
+# Thresholds and verdict logic (unchanged)
 _THRESHOLDS = {
     # RLL: +100 oracle, 0 baseline, <0 worse (larger is better)
     "RLL_raw": (0.20, 0.00), "RLL_calVAR": (0.20, 0.00), "RLL_calISO": (0.20, 0.00),
@@ -308,9 +332,25 @@ def run_uq_metrics(
     tag: str = "ensemble",
     log_path: str | Path = "metrics.log",
     ensemble_size: Optional[int] = None,
+    calibrators: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """
     Compute, calibrate (variance + isotonic) & log UQ metrics.
+
+    If `calibrators` is **None**, calibrators are fitted on the data from the
+    selected `split` (same behaviour as legacy). If `calibrators` is provided
+    it must be a dict containing fitted calibrators with keys:
+
+        {
+          'cal_var_F': VarianceScalingCalibrator,    # optional
+          'cal_iso_F': IsotonicCalibrator,           # optional
+          'cal_var_E': VarianceScalingCalibrator,    # optional (energies)
+          'cal_iso_E': IsotonicCalibrator,           # optional (energies)
+        }
+
+    This allows you to fit on train and apply on eval by calling
+    `run_uq_metrics(..., split='train')` to obtain calibrators and then
+    `run_uq_metrics(..., split='eval', calibrators=calibrators)`.
     """
 
     # ---------------- Residuals and Masks ----------------------------
@@ -333,40 +373,73 @@ def run_uq_metrics(
     else:
         delta_e = sigma_e = None
 
-    print(delta_e.mean(), np.median(delta_e))
+    # ========= DEBUG DIAGNOSTICS BEFORE CALIBRATION =========
+    def _show_stats(name, arr):
+        arrf = np.asarray(arr, dtype=float)
+        print(f"{name}: n={arrf.size}, min={np.nanmin(arrf):g}, "
+              f"p0.1={np.nanpercentile(arrf,0.1):g}, p1={np.nanpercentile(arrf,1):g}, "
+              f"p10={np.nanpercentile(arrf,10):g}, med={np.nanmedian(arrf):g}, "
+              f"mean={np.nanmean(arrf):g}, p90={np.nanpercentile(arrf,90):g}, "
+              f"p99={np.nanpercentile(arrf,99):g}, max={np.nanmax(arrf):g}")
+    
+    print("\n------ Diagnostics BEFORE calibration ------")
+    if delta_e is not None:
+        _show_stats("delta_e (energies)    ", delta_e)
+        _show_stats("sigma_e (energies)    ", sigma_e)
+    _show_stats("delta_c (components)  ", delta_c)
+    _show_stats("sigma_c (components)  ", sigma_c)
+    print("-------------------------------------------\n")
+    # =========================================================
+
     # --------- Calibration: Variance scaling and Isotonic Regression -----------
-    cal_var_F = VarianceScalingCalibrator().fit(delta_c, sigma_c)
+    # Helper that either uses provided calibrators or fits new ones on the
+    # current dataset (note: for honest evaluation, fit on TRAIN and pass
+    # calibrators to EVAL)
+    # --- FORCES
+    if calibrators is None or 'cal_var_F' not in calibrators:
+        cal_var_F = VarianceScalingCalibrator().fit(delta_c, sigma_c)
+    else:
+        cal_var_F = calibrators.get('cal_var_F')
+
     sigma_c_cal_var = cal_var_F.transform(sigma_c)
     sigma_a_cal_var = cal_var_F.transform(sigma_a)
-    # Isotonic
-    try:
-        from sklearn.isotonic import IsotonicRegression
-        class _Iso:
-            def __init__(self):
-                self._iso = IsotonicRegression(y_min=0.0, increasing=True, out_of_bounds="clip")
-            def fit(self, d, s):
-                idx = np.argsort(s)
-                self._iso.fit(s[idx], np.abs(d[idx]))
-                return self
-            def transform(self, s):
-                return self._iso.predict(_safe_sigma(s))
-        cal_iso_F = _Iso().fit(delta_c, sigma_c)
-        sigma_c_cal_iso = cal_iso_F.transform(sigma_c)
-        sigma_a_cal_iso = cal_iso_F.transform(sigma_a)
-    except Exception:
-        cal_iso_F = None
-        sigma_c_cal_iso = sigma_c
-        sigma_a_cal_iso = sigma_a
 
-    # Energies
-    if delta_e is not None:
-        cal_var_E = VarianceScalingCalibrator().fit(delta_e, sigma_e)
-        sigma_e_cal_var = cal_var_E.transform(sigma_e)
+    # isotonic: prefer to fit on the *scaled* sigma (after variance scaling)
+    if calibrators is None or 'cal_iso_F' not in calibrators:
         try:
-            cal_iso_E = _Iso().fit(delta_e, sigma_e)
-            sigma_e_cal_iso = cal_iso_E.transform(sigma_e)
+            cal_iso_F = IsotonicCalibrator().fit(delta_c, sigma_c_cal_var)
         except Exception:
-            sigma_e_cal_iso = sigma_e
+            cal_iso_F = None
+    else:
+        cal_iso_F = calibrators.get('cal_iso_F')
+
+    if cal_iso_F is not None:
+        sigma_c_cal_iso = cal_iso_F.transform(sigma_c_cal_var)
+        sigma_a_cal_iso = cal_iso_F.transform(sigma_a_cal_var)
+    else:
+        sigma_c_cal_iso = sigma_c_cal_var
+        sigma_a_cal_iso = sigma_a_cal_var
+
+    # --- ENERGIES (if present)
+    if delta_e is not None:
+        if calibrators is None or 'cal_var_E' not in calibrators:
+            cal_var_E = VarianceScalingCalibrator().fit(delta_e, sigma_e)
+        else:
+            cal_var_E = calibrators.get('cal_var_E')
+        sigma_e_cal_var = cal_var_E.transform(sigma_e)
+
+        if calibrators is None or 'cal_iso_E' not in calibrators:
+            try:
+                cal_iso_E = IsotonicCalibrator().fit(delta_e, sigma_e_cal_var)
+            except Exception:
+                cal_iso_E = None
+        else:
+            cal_iso_E = calibrators.get('cal_iso_E')
+
+        if cal_iso_E is not None:
+            sigma_e_cal_iso = cal_iso_E.transform(sigma_e_cal_var)
+        else:
+            sigma_e_cal_iso = sigma_e_cal_var
     else:
         sigma_e_cal_var = sigma_e_cal_iso = None
 
@@ -475,122 +548,114 @@ def run_uq_metrics(
         tNLL_calVAR_E = mean_student_t_nll(delta_e, np.zeros_like(delta_e), _safe_sigma(sigma_e_cal_var))
         tNLL_calISO_E = mean_student_t_nll(delta_e, np.zeros_like(delta_e), _safe_sigma(sigma_e_cal_iso))
 
-    # Define metrics and verdicts for table
-    row_names = ["NLL", "t-NLL", "RLL", "CRPS", "ENCE", "PICP95", "Sharpness", "CV", "KS_z", "Normal_p"]
+    # ------------ LOGGING TO FILE & TERMINAL PRINTING -------------------
+# ------------ DEFINE TABLE STRUCTURES -------------------
     col_names = ["RAW", "VAR", "ISO"]
+    
+    # Calculate Spearman metrics for the table
+    spearman_raw_F = spearman_corr(delta_a, sigma_a)
+    spearman_var_F = spearman_corr(delta_a, sigma_a_cal_var)
+    spearman_iso_F = spearman_corr(delta_a, sigma_a_cal_iso)
 
-    force_table = [
-        [m_raw_F["NLL_raw"],      m_var_F["NLL_calVAR"],      m_iso_F["NLL_calISO"]],
-        [tNLL_raw,                tNLL_calVAR,                tNLL_calISO],
-        [m_raw_F["RLL_raw"],      m_var_F["RLL_calVAR"],      m_iso_F["RLL_calISO"]],
-        [m_raw_F["CRPS_raw"],     m_var_F["CRPS_calVAR"],     m_iso_F["CRPS_calISO"]],
-        [m_raw_F["ENCE_raw"],     m_var_F["ENCE_calVAR"],     m_iso_F["ENCE_calISO"]],
-        [m_raw_F["PICP95_raw"],   m_var_F["PICP95_calVAR"],   m_iso_F["PICP95_calISO"]],
-        [m_raw_F["Sharpness_raw"],m_var_F["Sharpness_calVAR"],m_iso_F["Sharpness_calISO"]],
-        [m_raw_F["CV_raw"],       m_var_F["CV_calVAR"],       m_iso_F["CV_calISO"]],
-        [m_raw_F["KS_z_raw"],     m_var_F["KS_z_calVAR"],     m_iso_F["KS_z_calISO"]],
-        [m_raw_F["Normal_p_raw"], m_var_F["Normal_p_calVAR"], m_iso_F["Normal_p_calISO"]],
+    f_groups = [
+        ("Probabilistic", ["NLL", "t-NLL", "CRPS"], [
+            [m_raw_F["NLL_raw"], m_var_F["NLL_calVAR"], m_iso_F["NLL_calISO"]],
+            [tNLL_raw, tNLL_calVAR, tNLL_calISO],
+            [m_raw_F["CRPS_raw"], m_var_F["CRPS_calVAR"], m_iso_F["CRPS_calISO"]]
+        ]),
+        ("Calibration", ["ENCE", "PICP95"], [
+            [m_raw_F["ENCE_raw"], m_var_F["ENCE_calVAR"], m_iso_F["ENCE_calISO"]],
+            [m_raw_F["PICP95_raw"], m_var_F["PICP95_calVAR"], m_iso_F["PICP95_calISO"]]
+        ]),
+        ("Dispersion", ["Sharpness", "CV"], [
+            [m_raw_F["Sharpness_raw"], m_var_F["Sharpness_calVAR"], m_iso_F["Sharpness_calISO"]],
+            [m_raw_F["CV_raw"], m_var_F["CV_calVAR"], m_iso_F["CV_calISO"]]
+        ]),
+        ("Diagnostic", ["Spearman", "KS_z", "Normal_p"], [
+            [spearman_raw_F, spearman_var_F, spearman_iso_F],
+            [m_raw_F["KS_z_raw"], m_var_F["KS_z_calVAR"], m_iso_F["KS_z_calISO"]],
+            [m_raw_F["Normal_p_raw"], m_var_F["Normal_p_calVAR"], m_iso_F["Normal_p_calISO"]]
+        ])
     ]
-    if delta_e is not None:
-        energy_table = [
-            [m_raw_E["NLL_raw_E"],      m_var_E["NLL_calVAR_E"],      m_iso_E["NLL_calISO_E"]],
-            [tNLL_raw_E,                tNLL_calVAR_E,                tNLL_calISO_E],
-            [m_raw_E["RLL_raw_E"],      m_var_E["RLL_calVAR_E"],      m_iso_E["RLL_calISO_E"]],
-            [m_raw_E["CRPS_raw_E"],     m_var_E["CRPS_calVAR_E"],     m_iso_E["CRPS_calISO_E"]],
-            [m_raw_E["ENCE_raw_E"],     m_var_E["ENCE_calVAR_E"],     m_iso_E["ENCE_calISO_E"]],
-            [m_raw_E["PICP95_raw_E"],   m_var_E["PICP95_calVAR_E"],   m_iso_E["PICP95_calISO_E"]],
-            [m_raw_E["Sharpness_raw_E"],m_var_E["Sharpness_calVAR_E"],m_iso_E["Sharpness_calISO_E"]],
-            [m_raw_E["CV_raw_E"],       m_var_E["CV_calVAR_E"],       m_iso_E["CV_calISO_E"]],
-            [m_raw_E["KS_z_raw_E"],     m_var_E["KS_z_calVAR_E"],     m_iso_E["KS_z_calISO_E"]],
-            [m_raw_E["Normal_p_raw_E"], m_var_E["Normal_p_calVAR_E"], m_iso_E["Normal_p_calISO_E"]],
-        ]
 
-    # Qualitative verdicts for table
+    f_verdicts = {}
     context = {"NLL_base": mean_nll_base_c, "NLL_base_E": mean_nll_base_e}
-    force_verdicts = [
-        [qualitative_label(force_table[i][j], f"{row_names[i]}_{['raw','calVAR','calISO'][j]}", context)
-         for j in range(3)]
-        for i in range(len(row_names))
-    ]
+    for group_name, row_names, table_data in f_groups:
+        for i, name in enumerate(row_names):
+            f_verdicts[name] = [qualitative_label(table_data[i][j], f"{name}_{['raw','calVAR','calISO'][j]}", context) for j in range(3)]
+
     if delta_e is not None:
-        energy_verdicts = [
-            [qualitative_label(energy_table[i][j], f"{row_names[i]}_{['raw_E','calVAR_E','calISO_E'][j]}", context)
-             for j in range(3)]
-            for i in range(len(row_names))
+        spearman_raw_E = spearman_corr(delta_e, sigma_e)
+        spearman_var_E = spearman_corr(delta_e, sigma_e_cal_var)
+        spearman_iso_E = spearman_corr(delta_e, sigma_e_cal_iso)
+        
+        e_groups = [
+            ("Probabilistic", ["NLL", "t-NLL", "CRPS"], [
+                [m_raw_E["NLL_raw_E"], m_var_E["NLL_calVAR_E"], m_iso_E["NLL_calISO_E"]],
+                [tNLL_raw_E, tNLL_calVAR_E, tNLL_calISO_E],
+                [m_raw_E["CRPS_raw_E"], m_var_E["CRPS_calVAR_E"], m_iso_E["CRPS_calISO_E"]]
+            ]),
+            ("Calibration", ["ENCE", "PICP95"], [
+                [m_raw_E["ENCE_raw_E"], m_var_E["ENCE_calVAR_E"], m_iso_E["ENCE_calISO_E"]],
+                [m_raw_E["PICP95_raw_E"], m_var_E["PICP95_calVAR_E"], m_iso_E["PICP95_calISO_E"]]
+            ]),
+            ("Dispersion", ["Sharpness", "CV"], [
+                [m_raw_E["Sharpness_raw_E"], m_var_E["Sharpness_calVAR_E"], m_iso_E["Sharpness_calISO_E"]],
+                [m_raw_E["CV_raw_E"], m_var_E["CV_calVAR_E"], m_iso_E["CV_calISO_E"]]
+            ]),
+            ("Diagnostic", ["Spearman", "KS_z", "Normal_p"], [
+                [spearman_raw_E, spearman_var_E, spearman_iso_E],
+                [m_raw_E["KS_z_raw_E"], m_var_E["KS_z_calVAR_E"], m_iso_E["KS_z_calISO_E"]],
+                [m_raw_E["Normal_p_raw_E"], m_var_E["Normal_p_calVAR_E"], m_iso_E["Normal_p_calISO_E"]]
+            ])
         ]
+        e_verdicts = {}
+        for group_name, row_names, table_data in e_groups:
+            for i, name in enumerate(row_names):
+                e_verdicts[name] = [qualitative_label(table_data[i][j], f"{name}_{['raw_E','calVAR_E','calISO_E'][j]}", context) for j in range(3)]
 
-    # ------------ Best ENCE verdict -----------------------------------
-    best_F_idx = int(np.argmin([force_table[4][i] for i in range(3)]))  # ENCE row
-    best_E_idx = int(np.argmin([energy_table[4][i] for i in range(3)])) if delta_e is not None else 0
-    calib_labels = ["RAW", "VAR", "ISO"]
-
-    # ------------- Compose Output ------------------------------------
+    # ------------ LOGGING TO FILE & TERMINAL PRINTING -------------------
+    ence_F_vals = [m_raw_F["ENCE_raw"], m_var_F["ENCE_calVAR"], m_iso_F["ENCE_calISO"]]
+    best_F_idx = int(np.argmin(ence_F_vals))
+    
     banner = (
-        f"\n=== {split.upper()} | {tag} ===\n"
-        f"Best calibration for FORCES:   {calib_labels[best_F_idx]} (ENCE={force_table[3][best_F_idx]:.3f})\n"
+        f"\n=== UQ EVALUATION ({split.upper()}) ===\n"
+        f"★ Best Force Calibration: {col_names[best_F_idx]} (ENCE={ence_F_vals[best_F_idx]:.3f})\n"
+        f"{'─' * 60}"
     )
-    if delta_e is not None:
-        banner += f"Best calibration for ENERGIES: {calib_labels[best_E_idx]} (ENCE={energy_table[3][best_E_idx]:.3f})\n"
-    banner += "─" * 50
 
     print(banner)
-    print("Forces:")
-    print(pretty_table_full(row_names, col_names, force_table, force_verdicts))
+    print("FORCE UNCERTAINTY METRICS:\n" + pretty_table_full(f_groups, col_names, f_verdicts))
     if delta_e is not None:
-        print("\nEnergies:")
-        print(pretty_table_full(row_names, col_names, energy_table, energy_verdicts))
-    print("─" * 50)
+        print("\nENERGY UNCERTAINTY METRICS:\n" + pretty_table_full(e_groups, col_names, e_verdicts))
 
     _LOGGER.info(banner)
-    _LOGGER.info("\nForces:\n" + pretty_table_full(row_names, col_names, force_table, force_verdicts))
+    _LOGGER.info("\nFORCE UNCERTAINTY METRICS:\n" + pretty_table_full(f_groups, col_names, f_verdicts))
     if delta_e is not None:
-        _LOGGER.info("\nEnergies:\n" + pretty_table_full(row_names, col_names, energy_table, energy_verdicts))
-
-    # ------------ SUGGESTION SUMMARY -------------------------------
-    # Verdict for 'raw' (uncalibrated)
-    forces_raw_verdict = qualitative_label(m_raw_F['ENCE_raw'], "ENCE_raw")
-    if delta_e is not None:
-        energy_raw_verdict = qualitative_label(m_raw_E['ENCE_raw_E'], "ENCE_raw_E")
-    else:
-        energy_raw_verdict = "n/a"
-
-    # ------------ Best ENCE verdict -----------------------------------
-    best_F_idx = int(np.argmin([force_table[3][i] for i in range(3)]))  # ENCE row
-    best_F_label = calib_labels[best_F_idx]
-    best_F_val = force_table[3][best_F_idx]
-    if delta_e is not None:
-        best_E_idx = int(np.argmin([energy_table[3][i] for i in range(3)]))
-        best_E_label = calib_labels[best_E_idx]
-        best_E_val = energy_table[3][best_E_idx]
-    else:
-        best_E_label = None
-        best_E_val = None
+        _LOGGER.info("\nENERGY UNCERTAINTY METRICS:\n" + pretty_table_full(e_groups, col_names, e_verdicts))
 
     # ------------ SUGGESTION SUMMARY -------------------------------
     forces_raw_verdict = qualitative_label(m_raw_F['ENCE_raw'], "ENCE_raw")
-    if delta_e is not None:
-        energy_raw_verdict = qualitative_label(m_raw_E['ENCE_raw_E'], "ENCE_raw_E")
-    else:
-        energy_raw_verdict = "n/a"
 
-    lines = []
-    lines.append("=== UQ CALIBRATION SUGGESTION ===")
-
+    lines = ["=== UQ CALIBRATION SUGGESTION ==="]
     if forces_raw_verdict == "good":
-        lines.append("• Calibration is NOT needed for forces: uncalibrated uncertainties are already well calibrated (ENCE_raw = {:.3f})".format(m_raw_F['ENCE_raw']))
+        lines.append(f"• Calibration is NOT needed for forces: uncalibrated uncertainties are already well calibrated (ENCE_raw = {m_raw_F['ENCE_raw']:.3f})")
     else:
-        lines.append("• Best calibration for forces: {} (ENCE = {:.3f})".format(best_F_label, best_F_val))
+        lines.append(f"• Best calibration for forces: {col_names[best_F_idx]} (ENCE = {ence_F_vals[best_F_idx]:.3f})")
 
     if delta_e is not None:
+        ence_E_vals = [m_raw_E["ENCE_raw_E"], m_var_E["ENCE_calVAR_E"], m_iso_E["ENCE_calISO_E"]]
+        best_E_idx = int(np.argmin(ence_E_vals))
+        energy_raw_verdict = qualitative_label(m_raw_E['ENCE_raw_E'], "ENCE_raw_E")
+
         if energy_raw_verdict == "good":
-            lines.append("• Calibration is NOT needed for energies: uncalibrated uncertainties are already well calibrated (ENCE_raw_E = {:.3f})".format(m_raw_E['ENCE_raw_E']))
+            lines.append(f"• Calibration is NOT needed for energies: uncalibrated uncertainties are already well calibrated (ENCE_raw_E = {m_raw_E['ENCE_raw_E']:.3f})")
         else:
-            lines.append("• Best calibration for energies: {} (ENCE = {:.3f})".format(best_E_label, best_E_val))
+            lines.append(f"• Best calibration for energies: {col_names[best_E_idx]} (ENCE = {ence_E_vals[best_E_idx]:.3f})")
 
     suggestion_block = "\n".join(lines)
-    print(suggestion_block)
+    print("\n" + suggestion_block + "\n")
     _LOGGER.info("\n" + suggestion_block)
-
     # --------- MetricResult list, including all variants --------------
     metrics: list[MetricResult] = [
         MetricResult("NLL_base", mean_nll_base_c, "probabilistic"),
@@ -696,9 +761,22 @@ def run_uq_metrics(
         _LOGGER.warning("could not save plot data: %s", exc)
 
     # --- Return dict for further processing -----------------------------
+    # Return fitted calibrators so they can be re-used on other splits (train->eval)
+    out_calibrators: Dict[str, Any] = {}
+    try:
+        out_calibrators['cal_var_F'] = cal_var_F
+        out_calibrators['cal_iso_F'] = cal_iso_F
+        if delta_e is not None:
+            out_calibrators['cal_var_E'] = cal_var_E
+            out_calibrators['cal_iso_E'] = cal_iso_E
+    except Exception:
+        # best effort to include whatever exists
+        pass
+
     return {
         "metrics": {m.name: m.value for m in metrics},
         "npz_path": str(npz_path) if npz_path else None,
+        "calibrators": out_calibrators,
     }
 
 

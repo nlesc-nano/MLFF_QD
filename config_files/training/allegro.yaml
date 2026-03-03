@@ -2,12 +2,19 @@ run: [train, val, test]
 
 
 cutoff_radius: 12.0
-chemical_symbols: [Cd, Cl, Se] 
-model_type_names: ${chemical_symbols}
+model_type_names: [Cd, Cl, Se] 
+chemical_species: ${model_type_names}
 
 data:
   _target_: nequip.data.datamodule.ASEDataModule
-  seed: 456             
+  seed: 456   
+# Explicit dataset mode:
+# Use pre-split train/val/test files instead of split_dataset.
+# If any of these is set, all three are required and split_dataset is ignored.
+    # train_file_path: train.xyz
+    # val_file_path: val.xyz
+    # test_file_path: test.xyz
+    
   split_dataset:
     file_path:  #./consolidated_dataset_1000_CdSe_new.xyz
     train: 0.8
@@ -17,7 +24,7 @@ data:
     - _target_: nequip.data.transforms.NeighborListTransform
       r_max: ${cutoff_radius}
     - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
-      chemical_symbols: ${chemical_symbols}
+      model_type_names: ${model_type_names}
   
   train_dataloader:
     _target_: torch.utils.data.DataLoader
@@ -33,7 +40,7 @@ data:
 trainer:
   _target_: lightning.Trainer
   accelerator: auto
-  devices: 1
+  devices: 1    # NO of GPUs
   max_epochs: 3
   check_val_every_n_epoch: 1
   log_every_n_steps: 5
@@ -41,7 +48,7 @@ trainer:
   callbacks:
       
     - _target_: lightning.pytorch.callbacks.ModelCheckpoint
-      dirpath: ./results 
+      dirpath: ./resultsx
       filename: best
       save_last: true
     
@@ -52,7 +59,7 @@ trainer:
       
   logger:
     - _target_: lightning.pytorch.loggers.TensorBoardLogger
-      save_dir: ./logs
+      save_dir: ./resultsx
       name: tutorial_log
       version: null
       default_hp_metric: false
@@ -65,17 +72,21 @@ num_scalar_features: 64
 
 training_module:
   _target_: nequip.train.EMALightningModule
+  
   loss:
     _target_: nequip.train.EnergyForceLoss
     per_atom_energy: true
     coeffs:
       total_energy: 0.05
       forces: 0.95
+      
   val_metrics:
     _target_: nequip.train.EnergyForceMetrics
     coeffs:
       per_atom_energy_mae: 0.05
       forces_mae: 0.95
+      
+  train_metrics: ${training_module.val_metrics}
   test_metrics: ${training_module.val_metrics}
   optimizer:
     _target_: torch.optim.Adam
@@ -85,7 +96,9 @@ training_module:
   # to use the Allegro model in the NequIP framework, the following `model` block has to be changed to be that of Allegro's
   model:
     _target_: allegro.model.AllegroModel
-
+    
+    #compile_mode: compile
+    
     # === basic model params ===
     seed: 456
     model_dtype: float32
@@ -172,8 +185,4 @@ training_module:
     pair_potential:
       _target_: nequip.nn.pair_potential.ZBL
       units: real     # Ang and kcal/mol, LAMMPS unit names;  allowed values "metal" and "real"
-      chemical_species: ${chemical_symbols}   # must tell ZBL the chemical species of the various model atom types
-
-
-global_options:
-  allow_tf32: false
+      chemical_species: ${chemical_species}   # must tell ZBL the chemical species of the various model atom types

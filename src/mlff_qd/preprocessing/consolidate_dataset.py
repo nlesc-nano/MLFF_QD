@@ -11,9 +11,7 @@ from mlff_qd.utils.plots import ( plot_energy_and_forces,
 from mlff_qd.utils.helpers import ( analyze_reference_forces,
                                    suggest_thresholds )
 from mlff_qd.utils.pca import detect_outliers
-from mlff_qd.utils.cluster import ( select_kmeans_medoids,
-    generate_md_random_subsets,
-)
+from mlff_qd.utils.cluster import select_kmeans_medoids
 from mlff_qd.utils.descriptors import compute_local_descriptors
 from mlff_qd.utils.centering import process_xyz
 
@@ -38,7 +36,7 @@ def consolidate_dataset(cfg: Dict):
     logger.info(f"[Consolidate] parsing {infile}…")
     # 2) Parse stacked XYZ
     E, P, F, atoms = parse_stacked_xyz(infile)
-    labels_full = np.arange(len(E))  # Or your group/label logic here
+    labels_full = np.arange(len(E))  
 
     n_frames = len(E)
     n_atoms  = len(atoms)
@@ -52,7 +50,7 @@ def consolidate_dataset(cfg: Dict):
     var_force = F.var(axis=(1,2))
     global_feats = np.vstack((E, avg_force, var_force)).T
 
-    # 5) Outlier stats
+    # 5) Outlier statistics and suggested thresholds
     force_stats = analyze_reference_forces(F, atoms)
     suggest_thresholds(force_stats)
 
@@ -64,7 +62,7 @@ def consolidate_dataset(cfg: Dict):
     raw_feats = np.hstack((global_feats, local_feats))
     feats     = StandardScaler().fit_transform(raw_feats)
 
-    # 8) IsolationForest filtering
+    # 8) Outlier detection via IsolationForest
     inliers_mask = detect_outliers(
         feats,
         contamination=cont,

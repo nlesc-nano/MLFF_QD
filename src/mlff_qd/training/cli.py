@@ -15,9 +15,11 @@ from mlff_qd.training.training import run_schnet_training
 from mlff_qd.training.inference import run_schnet_inference
 from mlff_qd.utils.standardize_output import standardize_output
 from mlff_qd.utils.yaml_utils import get_dataset_paths_from_yaml
-
 from mlff_qd.benchmarks.benchmark_mlff import extract_metrics, post_process_benchmark
-
+try:
+    from mlff_qd.fine_tuning.fine_tune import main as run_schnet_fine_tuning
+except ImportError:
+    run_schnet_fine_tuning = None
 
 def run_benchmark(args, scratch_dir):
     engines = ['schnet', 'painn', 'fusion', 'nequip', 'allegro', 'mace']
@@ -75,8 +77,8 @@ def run_benchmark(args, scratch_dir):
         shutil.copytree(standardized_src, engine_results_dir, dirs_exist_ok=True)
         shutil.rmtree(standardized_src)
         
-        # Extract metrics (use your extract logic here or from benchmark_mlff.py if separate)
-        engine_df = extract_metrics(engine_results_dir, engine, engine_cfg)  # Assume you have this function
+        # Extract metrics
+        engine_df = extract_metrics(engine_results_dir, engine, engine_cfg)
         results.append(engine_df)
     
     if results:
@@ -92,7 +94,7 @@ def parse_args():
     parser.add_argument("--input", help="Path to input XYZ file (overrides input_xyz_file in YAML)")
     parser.add_argument("--only-generate", action="store_true", help="Only generate engine YAML, do not run training")
     parser.add_argument("--train-after-generate", action="store_true", help="Generate engine YAML and immediately start training")
-    parser.add_argument("--benchmark", action="store_true", help="Run benchmarking across all engines")  # New flag
+    parser.add_argument("--benchmark", action="store_true", help="Run benchmarking across all engines") 
     parser.add_argument("--post-process", action="store_true", help="Post-process benchmark results and generate summary")
     return parser.parse_args()
 
@@ -122,42 +124,128 @@ def get_output_dir(engine_cfg, platform):
             continue
     return "./results"
 
+EXPLICIT_KEYS = ("train_file_path", "val_file_path", "test_file_path")
+
+def _key_present(dct, key: str) -> bool:
+    # key exists in YAML even if value is null/empty
+    return isinstance(dct, dict) and (key in dct)
+
+def _missing_value(v) -> bool:
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
 def patch_and_validate_yaml(yaml_path, platform, xyz_path=None, scratch_dir=None, write_temp=True):
     with open(yaml_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+
     data_path = xyz_path
+
     if not data_path:
         if platform in ["schnet", "painn", "fusion"]:
             data_path = config.get("data", {}).get("dataset_path", None)
+        
         elif platform in ["nequip", "allegro"]:
-            data_path = config.get("data", {}).get("split_dataset", {}).get("file_path", None)
+            d = config.get("data", {}) or {}
+
+            # MODE A intent: if user provided ANY explicit key (even null/empty), treat as explicit-mode attempt
+            explicit_intent = any(_key_present(d, k) for k in EXPLICIT_KEYS)
+
+            if explicit_intent:
+                logging.info(f"[{platform}] Running in MODE A: Explicit files (train_file_path, val_file_path, test_file_path)")
+
+                # Require all three keys
+                missing_keys = [k for k in EXPLICIT_KEYS if not _key_present(d, k)]
+                if missing_keys:
+                    raise ValueError(
+                        f"[{platform}] Explicit file mode detected, but missing keys: {', '.join(missing_keys)}. "
+                        f"Either provide all of {', '.join(EXPLICIT_KEYS)} OR remove them and use data.split_dataset."
+                    )
+
+                # Require non-empty values
+                bad_vals = [k for k in EXPLICIT_KEYS if _missing_value(d.get(k))]
+                if bad_vals:
+                    raise ValueError(
+                        f"[{platform}] Explicit file mode detected, but these are null/empty: {', '.join(bad_vals)}. "
+                        f"Either set valid paths for all three OR remove those keys and use data.split_dataset instead."
+                    )
+
+                # Validate files exist + extension
+                for k in EXPLICIT_KEYS:
+                    p = d[k]
+                    if not os.path.exists(p):
+                        raise ValueError(f"[{platform}] Missing file: {p}")
+                    validate_input_file(p, platform)
+
+                # Remove split_dataset to avoid ambiguity
+                d.pop("split_dataset", None)
+                config["data"] = d
+
+                # Placeholder for the legacy flow checks below
+                data_path = d["train_file_path"]
+
+            else:
+                logging.info(f"[{platform}] Running in MODE B: Using split_dataset for data split.")
+                data_path = (d.get("split_dataset") or {}).get("file_path", None)
+
+                if not data_path:
+                    raise ValueError(
+                        f"[{platform}] Missing split_dataset.file_path (and no explicit train/val/test keys provided)."
+                    )
+                if not os.path.exists(data_path):
+                    raise ValueError(f"[{platform}] Missing file for split_dataset: {data_path}")
+
+        
         elif platform == "mace":
             data_path = config.get("train_file", None)
-            
+
+    # If user passed --input (xyz_path), it should override ONLY in split mode.
+    # In explicit mode, we do NOT override train/val/test with --input.
+    if platform in ["nequip", "allegro"] and xyz_path:
+        d = config.get("data", {}) or {}
+        explicit_mode = any(k in d for k in ("train_file_path", "val_file_path", "test_file_path"))
+
+        if not explicit_mode:
+            data_path = xyz_path
+
+    # Generic missing-path check
     if not data_path or not os.path.exists(data_path):
         raise ValueError(
             f"YAML file {yaml_path} is missing a valid data path for platform '{platform}'.\n"
             "Either add the correct dataset path to your YAML or provide --input."
         )
-           
-     # --- NEW: extension validation only, no conversion ---
+
+    # Input validation only, no conversion
     data_path = validate_input_file(data_path, platform)
-    
-    # Patch original path back into config (no conversion)
+
+    # Patch path back into config
     if platform in ["schnet", "painn", "fusion"]:
         config.setdefault("data", {})["dataset_path"] = data_path
+
     elif platform in ["nequip", "allegro"]:
-        config.setdefault("data", {}).setdefault("split_dataset", {})["file_path"] = data_path
+        d = config.setdefault("data", {})
+
+        # If explicit mode exists, keep it and ensure split_dataset removed
+        if d.get("train_file_path") and d.get("val_file_path"):
+            d.pop("split_dataset", None)
+
+            # re-validate again after patching, just to be safe but its optional:
+            for k in ("train_file_path", "val_file_path", "test_file_path"):
+                p = d.get(k)
+                if p is None:
+                    continue
+                validate_input_file(p, platform)
+
+        # Otherwise split mode
+        else:
+            d.setdefault("split_dataset", {})["file_path"] = data_path
+
     elif platform == "mace":
         config["train_file"] = data_path
-    
-     # Normalize DDP keys before writing the YAML
-    # apply_autoddp(config)
-    # Normalize engine-specific flags before writing the YAML
+
+    # Normalize engine-specific flags before writing YAML
     if platform in ["nequip", "allegro"]:
         apply_autoddp(config)
 
-    
+    # Write YAML out
     if write_temp:
         if not scratch_dir:
             scratch_dir = tempfile.gettempdir()
@@ -170,6 +258,7 @@ def patch_and_validate_yaml(yaml_path, platform, xyz_path=None, scratch_dir=None
             yaml.dump(config, f)
         return yaml_path
 
+
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -181,11 +270,6 @@ def main():
 
     scratch_dir = os.environ.get("SCRATCH_DIR", tempfile.gettempdir())
     os.makedirs(scratch_dir, exist_ok=True)
-
-
-    # if args.benchmark:
-        # run_benchmark(args, scratch_dir)
-        # return
         
     if args.benchmark:
         run_benchmark(args, scratch_dir)
@@ -236,11 +320,28 @@ def main():
     if not (args.only_generate or (is_unified and not args.train_after_generate)):
         print(f"[INFO] Engine YAML generated at: {engine_yaml}")
         print(f"[INFO] Now starting training for {platform}...\n")
-        
+    
+    # Fine-tuning 
     try:
+        is_finetuning = user_yaml_dict.get("common", {}).get("fine_tuning", {}).get("enabled", False)
         if platform in ["schnet", "painn", "fusion"]:
-            run_schnet_training(engine_yaml)
-            run_schnet_inference(engine_yaml)
+        
+            if is_finetuning:
+                print(f"[CLI] Fine-tuning mode detected for {platform}.")
+                
+                if run_schnet_fine_tuning is None:
+                    raise ImportError("Could not import 'main' from mlff_qd.fine_tuning.fine_tune.")
+
+                # Create mock args because fine_tune.py expects args.config
+                class MockArgs:
+                    config = engine_yaml
+                
+                run_schnet_fine_tuning(MockArgs())
+                print(f"[CLI] Fine-tuning completed.")
+            else:
+                run_schnet_training(engine_yaml, engine=platform)
+                run_schnet_inference(engine_yaml, engine=platform)
+
         elif platform == "nequip":
             run_nequip_training(os.path.abspath(engine_yaml))
         elif platform == "mace":
@@ -261,7 +362,8 @@ def main():
             best_model_dir=best_model_dir,
             explicit_data_paths=explicit_paths
         )
-        logging.info(f"Output standardized to {standardized_dir}")
+        logging.info(f"[paths] Result dir (engine output): {results_dir}")
+        logging.info(f"[paths] Standardized output dir: {standardized_dir}")
 
     except Exception as e:
         logging.error(f"Training or inference failed for platform {platform}: {str(e)}")

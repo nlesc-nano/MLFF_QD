@@ -287,6 +287,15 @@ class NequipCalculator(BaseCalculator):
     def prepare_batch(self, frames):
         # Initialize the ASE calculator on the first batch
         if self.calc is None:
+            # --- cuEquivariance Detection (NequIP ASE path) ---
+            # IMPORTANT: import must happen BEFORE loading a cuEquivariance-compiled NequIP model
+            try:
+                import cuequivariance_torch  # noqa: F401
+                print("cuEquivariance detected! NequIP can use accelerated ops (if model compiled with cuEquivariance).")
+            except ImportError:
+                print("cuEquivariance not found. NequIP will use standard ops.")
+            # -----------------------------------------------
+
             from nequip.ase import NequIPCalculator
             
             # IDENTITY MAPPING: Extract species from the first frame and map them
@@ -584,4 +593,3 @@ def evaluate_model(frames, true_energies, true_forces, model_obj, device, batch_
         print(f"Critical error initializing evaluate_model: {e}")
         traceback.print_exc()
         return None, None, None, None
-

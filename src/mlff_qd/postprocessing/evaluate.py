@@ -185,7 +185,8 @@ class EnsembleRunner:
             # Auto-detect extension
             model_path = None
             for base_path in base_paths:
-                for ext in ["", ".pth", ".pt", ".nequip.pth"]:
+                # Prioritize .nequip.pth for your NequIP setup
+                for ext in [".nequip.pth", ".pth", ".pt", ""]:
                     if os.path.exists(base_path + ext):
                         model_path = base_path + ext
                         break
@@ -193,7 +194,7 @@ class EnsembleRunner:
                     break
 
             if model_path is None:
-                print(f"     Failed to find model {m_idx+1}: {base_paths[0]}(.pth/.pt)")
+                print(f"     Failed to find model {m_idx+1}: {base_paths[0]}(.nequip.pth/.pth)")
                 continue
 
             print(f"  -> Model {m_idx+1}/{self.n_models}: {model_path}")
@@ -471,10 +472,16 @@ class EvaluationPipeline:
             
         np.savez_compressed("pool_energy_trace.npz", steps=np.arange(len(mu_E_pool)), mu=sm["mu"].values, sigma=sm["sigma"].values, bad=bad_mask)
 
-        # Calibrations
-        good_rows = np.isfinite(F_train_thin).all(axis=1) & np.isfinite(stats_ens.delta_E_frame[self.ds["train_idx"]])
+        # ---  SCRIPT FIX: Ensure F_train_thin is 2D for NequIP compatibility ---
+        F_train_2d = F_train_thin.reshape(-1, 1) if F_train_thin.ndim == 1 else F_train_thin
+        
+        good_rows = np.isfinite(F_train_2d).all(axis=1) & np.isfinite(stats_ens.delta_E_frame[self.ds["train_idx"]])
         print(f"[Pool-AL] Extracted {good_rows.sum()} valid training frames for GP calibration.")
-        alpha_sq, _, _, _, L_chol = calibrate_alpha_reg_gcv(F_train_thin[good_rows], stats_ens.delta_E_frame[self.ds["train_idx"]][good_rows])
+        
+        alpha_sq, _, _, _, L_chol = calibrate_alpha_reg_gcv(
+            F_train_2d[good_rows], 
+            stats_ens.delta_E_frame[self.ds["train_idx"]][good_rows]
+        )
 
         calibrator = UQCalibrator()
         mu_E_train = stats_ens.pred_energies[self.ds["train_idx"]]
@@ -484,7 +491,7 @@ class EvaluationPipeline:
         # Selection
         print("[Pool-AL] Running windowed active learning on thinned pool ...")
         _, sel_rel_thin = adaptive_learning_mig_pool_windowed(
-            pool_frames_thin, F_pool_thin, F_train_thin, alpha_sq, L_chol,
+            pool_frames_thin, F_pool_thin, F_train_2d, alpha_sq, L_chol,
             forces_train=self.ds["F_train_arr"], sigma_energy=sigma_E_raw, sigma_force=sigma_comp,
             mu_E_frame_train=mu_E_train, mu_E_pool=mu_E_pool_thin, sigma_E_pool=sigma_E_pool_thin,
             mu_F_pool=mu_F_pool_thin, sigma_F_pool=sigma_F_pool_thin, rdf_thresholds=rdf_thresholds,
@@ -520,4 +527,3 @@ def run_eval(config):
         return
     pipeline = EvaluationPipeline(config)
     pipeline.run()
-

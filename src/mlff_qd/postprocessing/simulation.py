@@ -85,15 +85,29 @@ def get_ase_calculator(model, config, device, neighbor_list):
 
     elif framework == "mace":
         from mace.calculators import MACECalculator
-        return MACECalculator(model=model, device=str(device), default_dtype="float32")
+        return MACECalculator(models=model, device=str(device), default_dtype="float32")
 
     elif framework == "nequip":
         from nequip.ase import NequIPCalculator
         from ase.io import read
+        import torch
+
+        try:
+            import cuequivariance_torch
+            import cuequivariance_ops_torch
+            
+            # Explicitly access the op to force TorchScript registration
+            # This prevents the 'Unknown builtin op: cuequivariance::uniform_1d' error
+            _ = torch.ops.cuequivariance.uniform_1d
+            print(">>> SUCCESS: Allegro cuEquivariance acceleration and ops registered.")
+        except Exception as e:
+            print(f">>> WARNING: cuEquivariance registration incomplete: {e}")
+
         try:
             atoms_temp = read(config.get("initial_xyz"))
             species = sorted(list(set(atoms_temp.get_chemical_symbols())))
             chemical_map = {s: s for s in species}
+            print(f">>> Species mapping detected for Allegro: {chemical_map}")
         except Exception:
             chemical_map = None
 
@@ -104,6 +118,7 @@ def get_ase_calculator(model, config, device, neighbor_list):
         )
     else:
         raise ValueError(f"Unknown framework: {framework}")
+
 
 def _reset_timers():
     """
@@ -117,12 +132,6 @@ def _reset_timers():
 def _log_status_line(log_file, header, values_format, values):
     """
     Helper to write a status line to a log file.
-
-    Parameters:
-      log_file (str): Path to the log file.
-      header (str): Header line to write if file is empty.
-      values_format (str): A format string for the values.
-      values (tuple): Tuple of values to log.
     """
     if not log_file:
         return
@@ -140,12 +149,6 @@ def _log_status_line(log_file, header, values_format, values):
 def log_geo_opt_status(optimizer, atoms, log_file, trajectory_file):
     """
     Logs geometry optimization status to a log file.
-
-    Parameters:
-      optimizer: Optimizer object.
-      atoms (ase.Atoms): The atomic structure.
-      log_file (str): Path to the log file.
-      trajectory_file (str): File name for the geometry optimization trajectory.
     """
     global last_call_time, cumulative_time
     now = time.time()
@@ -155,16 +158,15 @@ def log_geo_opt_status(optimizer, atoms, log_file, trajectory_file):
 
     step = optimizer.get_number_of_steps()
     e_pot = atoms.get_potential_energy()
-    forces = atoms.get_forces(apply_constraint=False) # Get forces after energy
+    forces = atoms.get_forces(apply_constraint=False)
     max_force = np.sqrt((forces**2).sum(axis=1).max()) if len(forces) > 0 else 0.0
 
-    # Access results safely from the calculator
     calc_results = {}
     if hasattr(atoms, 'calc') and atoms.calc is not None and hasattr(atoms.calc, 'results'):
          calc_results = atoms.calc.results
 
-    E_ml_only = calc_results.get("E_ml_avg", np.nan) # Use E_ml_avg which is ML energy
-    E_coul = calc_results.get("coul_fn_energy", np.nan) # Use coul_fn_energy
+    E_ml_only = calc_results.get("E_ml_avg", np.nan)
+    E_coul = calc_results.get("coul_fn_energy", np.nan)
     ml_time = calc_results.get("ml_time", 0.0)
     coul_fn_time = calc_results.get("coul_fn_time", 0.0)
 
@@ -185,7 +187,6 @@ def log_geo_opt_status(optimizer, atoms, log_file, trajectory_file):
 
     if trajectory_file:
         try:
-            # Write using ASE's write function for extxyz format
             write(trajectory_file, atoms, append=True, format='extxyz')
         except IOError as e:
             print(f"Warning: Failed to write trajectory frame {step}: {e}")
@@ -201,16 +202,6 @@ def log_vib_opt_status(optimizer, atoms, log_file, trajectory_file):
 # === Simulation Drivers ===
 
 def run_geo_opt(atoms, model_obj, device, neighbor_list, config):
-    """
-    Runs geometry optimization using ASE's BFGSLineSearch optimizer.
-
-    Parameters:
-      atoms (ase.Atoms): The atomic structure to be optimized.
-      model_obj: Pre-trained PyTorch model.
-      device: Torch device.
-      neighbor_list: Neighbor list object.
-      config (dict): Configuration parameters.
-    """
     _reset_timers()
     geo_config = config.get("geo_opt", {})
     geo_opt_fmax = geo_config.get("geo_opt_fmax", 0.02)
@@ -219,14 +210,11 @@ def run_geo_opt(atoms, model_obj, device, neighbor_list, config):
     log_file = geo_config.get("log_file_geo_opt", "simulation_opt.log")
 
     print("Setting up calculator for Geometry Optimization...")
-    # Correct instantiation using the signature from calculator.py
     calc = get_ase_calculator(model_obj, config, device, neighbor_list)
     atoms.calc = calc
 
     print(f"Running Geometry Optimization (fmax={geo_opt_fmax}, steps={geo_opt_steps})...")
-    # Use atoms directly, no need for Optimizable wrapper unless constraints change
     optimizer = BFGSLineSearch(atoms, logfile=None, maxstep=0.04)
-    # Pass optimizer itself to the logger function
     optimizer.attach(
         lambda opt=optimizer: log_geo_opt_status(opt, atoms, log_file, trajectory_file),
         interval=1
@@ -236,14 +224,12 @@ def run_geo_opt(atoms, model_obj, device, neighbor_list, config):
         optimizer.run(fmax=geo_opt_fmax, steps=geo_opt_steps)
     except Exception as e:
         print(f"Error during geometry optimization: {e}")
-        import traceback
         traceback.print_exc()
 
     print("Geometry Optimization Finished.")
 
 
-def _log_status_line(log_file, header, fmt, values):
-    """Append one nicely formatted line to *log_file* (create if absent)."""
+def _log_status_line_md(log_file, header, fmt, values):
     line = fmt.format(*values)
     if log_file:
         fresh = not Path(log_file).exists()
@@ -251,13 +237,12 @@ def _log_status_line(log_file, header, fmt, values):
             if fresh:
                 fh.write(header + "\n")
             fh.write(line + "\n")
-    else:                       # fall back to console
+    else:
         print(header)
         print(line)
 
 
 def _write_xyz_frame(atoms, step, md_time, T_set, friction, e_pot, traj_file):
-    """Append one extended-XYZ frame (with forces) to *traj_file*."""
     if not traj_file:
         return
     forces = atoms.get_forces()
@@ -287,10 +272,6 @@ def print_md_status(
     dt_fs,
     friction,
 ):
-    """
-    Log one line with energies, timing, etc.  **Do not** write XYZ here –
-    that now lives in a separate callback.
-    """
     global last_call_time, cumulative_time
 
     now = time.time()
@@ -305,11 +286,10 @@ def print_md_status(
     temp_inst = e_kin / (1.5 * units.kB * len(atoms)) if len(atoms) else 0.0
     T_set = getattr(dyn, "temperature_K", np.nan)
 
-    # optional extras from calculator -------------------------------------------------
     calc_results = getattr(atoms.calc, "results", {})
     E_ml_only   = calc_results.get("E_ml_avg",      np.nan)
     E_coul      = calc_results.get("coul_fn_energy", np.nan)
-    ml_time     = calc_results.get("ml_time",       0.0)
+    ml_time     = calc_results.get("ml_time",        0.0)
     coul_fn_time = calc_results.get("coul_fn_time", 0.0)
 
     header = (
@@ -324,7 +304,7 @@ def print_md_status(
         "{:8.4f} | {:9.4f} | {:8.4f} | {:9.4f}"
     )
 
-    _log_status_line(
+    _log_status_line_md(
         log_file,
         header,
         fmt,
@@ -338,11 +318,7 @@ def print_md_status(
     )
 
 
-
-
 def run_md(atoms, model_obj, device, neighbor_list, config):
-    """Top-level MD driver with tidy, non-overlapping callbacks."""
-
     md            = config["md"]
     dt_fs         = md.get("timestep_fs",      2.0)
     nsteps        = md.get("steps",            5000)
@@ -353,16 +329,10 @@ def run_md(atoms, model_obj, device, neighbor_list, config):
     traj_file     = md.get("trajectory_file_md")
     log_file      = md.get("log_file")
 
-    # -----------------------------------------------------------------
-    #  calculator + starting velocities
-    # -----------------------------------------------------------------
     calc = get_ase_calculator(model_obj, config, device, neighbor_list)
     atoms.calc = calc
     MaxwellBoltzmannDistribution(atoms, temperature_K=T0/8)
 
-    # -----------------------------------------------------------------
-    #  choose integrator
-    # -----------------------------------------------------------------
     if use_langevin:
         gamma_fs      = md.get("friction_coefficient", 0.01)
         dyn = Langevin(
@@ -374,11 +344,8 @@ def run_md(atoms, model_obj, device, neighbor_list, config):
     else:
         from ase.md.verlet import VelocityVerlet
         dyn = VelocityVerlet(atoms, timestep = dt_fs * units.fs)
-        gamma_fs = 0.0                                 # for logging
+        gamma_fs = 0.0
 
-    # -----------------------------------------------------------------
-    #  callbacks
-    # -----------------------------------------------------------------
     dyn.attach(
         lambda: print_md_status(
             dyn, atoms, log_file, dt_fs, gamma_fs
@@ -400,29 +367,12 @@ def run_md(atoms, model_obj, device, neighbor_list, config):
             interval=xyz_int,
         )
 
-    # -----------------------------------------------------------------
-    #  run!
-    # -----------------------------------------------------------------
     print(f"Running MD: {nsteps} steps · Δt = {dt_fs} fs · thermostat = {('Langevin γ = %.5f' % gamma_fs) if use_langevin else 'VelocityVerlet'}")
     dyn.run(nsteps)
     print("MD finished.")
 
 
-
 def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
-    """
-    Runs vibrational analysis, including tight geometry optimization and frequency calculation.
-
-    Parameters:
-      atoms (ase.Atoms): The atomic structure.
-      model_obj: Pre-trained PyTorch model.
-      device: Torch device.
-      neighbor_list: Neighbor list object.
-      config (dict): Configuration for vibrational analysis.
-
-    Returns:
-      np.ndarray: Array of vibrational frequencies in cm^-1, or None if failed.
-    """
     _reset_timers()
     vib_config = config.get("vib", {})
     vib_opt_fmax = vib_config.get("vib_opt_fmax", 0.001)
@@ -434,13 +384,11 @@ def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
     delta = vib_config.get("delta", 0.01)
 
     print("Setting up calculator for Vibrational Analysis...")
-    # Correct instantiation
     calc = get_ase_calculator(model_obj, config, device, neighbor_list)
     atoms.calc = calc
 
     print(f"Running tight Geometry Optimization for Vibrations (fmax={vib_opt_fmax}, steps={vib_opt_steps})...")
-    optimizer = BFGSLineSearch(atoms, logfile=None, maxstep=0.02) # Smaller maxstep for tighter opt
-    # Attach logger using the vib log file
+    optimizer = BFGSLineSearch(atoms, logfile=None, maxstep=0.02)
     optimizer.attach(
         lambda opt=optimizer: log_vib_opt_status(opt, atoms, log_file_vib, trajectory_file_vib),
         interval=1
@@ -450,13 +398,10 @@ def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
         optimizer.run(fmax=vib_opt_fmax, steps=vib_opt_steps)
     except Exception as e:
         print(f"Error during tight geometry optimization for vibrations: {e}")
-        import traceback
         traceback.print_exc()
-        print("Cannot proceed with vibration calculation.")
         return None
 
     print("Tight Geometry Optimization Finished.")
-
     print(f"Calculating Vibrations (delta={delta} Ang)...")
     try:
         vib = Vibrations(atoms, delta=delta)
@@ -464,35 +409,27 @@ def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
         print("Vibrations calculation finished.")
     except Exception as e:
         print(f"Error during vibrations calculation: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
-    # === Process Vibrational Modes ===
-    # Standard ASE conversion factor for Vibrations frequencies (which are in meV)
-    meV_to_cm1 = units.invcm # Should be ~8.06554
+    meV_to_cm1 = units.invcm
     frequencies_meV = vib.get_frequencies()
     frequencies_cm = []
     imag_modes_count = 0
 
     for f_meV in frequencies_meV:
         if isinstance(f_meV, complex):
-            # Check imaginary part magnitude - threshold might need adjustment
             if abs(f_meV.imag) > 1e-4:
-                # Mark imaginary modes with negative sign
                 frequencies_cm.append(-abs(f_meV.imag * meV_to_cm1))
                 imag_modes_count += 1
             else:
-                # Treat as real if imaginary part is negligible
                 frequencies_cm.append(f_meV.real * meV_to_cm1)
         else:
-            # Handle real frequencies directly
             frequencies_cm.append(f_meV * meV_to_cm1)
 
     frequencies_cm = np.array(frequencies_cm)
     print(f"Found {imag_modes_count} imaginary modes (marked negative).")
 
-    # === Save Frequencies ===
     try:
         with open(vib_output_file, "w") as f:
             f.write("# Vibrational Frequencies (cm^-1)\n")
@@ -503,45 +440,27 @@ def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
     except IOError as e:
         print(f"Warning: Failed to write frequencies file: {e}")
 
-    # === Save Molden File (Use ASE's built-in method if possible) ===
     molden_file = vib_output_file.replace(".txt", ".molden")
     try:
-        # ASE's write_molden uses atomic units (Bohr) by default
         vib.write_molden(molden_file)
         print(f"Molden file saved to {molden_file}")
-    except AttributeError:
-         print(f"Warning: Current ASE version might not support vib.write_molden(). Skipping Molden file.")
     except Exception as e:
-        print(f"Warning: Failed to write Molden file: {e}")
-        traceback.print_exc() # Print traceback for Molden write errors
+        print(f"Warning: Could not write Molden file: {e}")
 
-
-    # === Plot VDOS ===
     try:
-        # Filter out imaginary frequencies for VDOS plot
         real_frequencies_cm = frequencies_cm[frequencies_cm >= 0]
-        if len(real_frequencies_cm) == 0:
-            print("Warning: No real frequencies found for VDOS plot.")
-        else:
-            # Determine frequency range dynamically
+        if len(real_frequencies_cm) > 0:
             freq_min_plot = 0
-            freq_max_plot = max(real_frequencies_cm) * 1.1 if len(real_frequencies_cm) > 0 else 100
+            freq_max_plot = max(real_frequencies_cm) * 1.1
             freq_range = np.linspace(freq_min_plot, freq_max_plot, 1000)
             vdos = np.zeros_like(freq_range)
-            # Get broadening from config or use default
             sigma_vdos = vib_config.get("vdos_broadening_cm", 10.0)
 
-            # Gaussian broadening
             for freq in real_frequencies_cm:
                 vdos += np.exp(-((freq_range - freq)**2) / (2 * sigma_vdos**2))
 
-            # Normalize VDOS if it's not all zero
             max_vdos = np.max(vdos)
-            if max_vdos > 1e-9:
-                vdos /= max_vdos
-            else:
-                print("Warning: VDOS intensity is near zero. Plot may be empty.")
-
+            if max_vdos > 1e-9: vdos /= max_vdos
 
             plt.figure(figsize=(10, 6))
             plt.plot(freq_range, vdos, 'b-', label=f'VDOS ($\\sigma={sigma_vdos:.1f}$ cm$^{{-1}}$)')
@@ -550,15 +469,12 @@ def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
             plt.title('Vibrational Density of States')
             plt.grid(True, linestyle='--', alpha=0.6)
             plt.xlim(left=freq_min_plot)
-            plt.ylim(bottom=0) # Start y-axis at 0
+            plt.ylim(bottom=0)
             plt.legend()
             plt.savefig(vdos_plot_file)
             plt.close()
             print(f"VDOS plot saved to {vdos_plot_file}")
-
     except Exception as e:
         print(f"Warning: Failed to generate VDOS plot: {e}")
-        traceback.print_exc() # Print traceback for VDOS errors
 
     return frequencies_cm
-

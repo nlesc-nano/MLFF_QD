@@ -12,6 +12,7 @@ error_table: PerAtomMAE   # Report validation metrics using MAE
 device: cuda              # Options: cpu, cuda, mps, xpu
 default_dtype: float32
 distributed: false    # True for multiple GPU  keys: true, false
+enable_cueq: true
 # ===========================
 # Dataset & Keys
 # ===========================

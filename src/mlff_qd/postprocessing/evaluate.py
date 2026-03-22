@@ -3,6 +3,7 @@ evaluate.py
 
 This module orchestrates the evaluation process for ML force-field models.
 Refactored in 2025: Fully object-oriented, removing all legacy code.
+Updated 2026: Added Sequential Multi-GPU (MACE only) & RAM safety.
 """
 
 import os
@@ -10,6 +11,8 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+import torch.serialization
+torch.serialization.add_safe_globals([slice])
 import matplotlib.pyplot as plt
 from ase.io import read, write
 from sklearn.isotonic import IsotonicRegression
@@ -25,8 +28,8 @@ from mlff_qd.postprocessing.plotting import generate_uq_plots
 
 # Active Learning & Geometry Sanity
 from mlff_qd.postprocessing.active_learning import (
-    calibrate_alpha_reg_gcv, 
-    adaptive_learning_mig_pool_windowed, 
+    calibrate_alpha_reg_gcv,
+    adaptive_learning_mig_pool_windowed,
     adaptive_learning_ensemble_calibrated
 )
 from mlff_qd.postprocessing.rdf import (
@@ -62,7 +65,7 @@ class UQCalibrator:
         if not self.is_fitted: return
         os.makedirs(out_dir, exist_ok=True)
         delta_train_abs = np.abs(delta_E_train)
-        
+
         # Uncertainty Scatter
         plt.figure(figsize=(5,4))
         plt.scatter(sigma_E_train, delta_train_abs, s=8, alpha=0.6, label="train")
@@ -97,19 +100,19 @@ class DatasetManager:
         self.eval_cfg = config.get("eval", {})
         self.train_path = self.eval_cfg.get("training_data")
         self.eval_path = self.eval_cfg.get("eval_input_xyz")
-        
+
     def load_datasets(self):
         print("\n--- Setting up Datasets ---")
         assert self.eval_path and os.path.exists(self.eval_path), f"Eval file not found: {self.eval_path}"
-        
+
         val_E, val_F, val_pos = parse_extxyz(self.eval_path, "eval")
         val_frames = read(self.eval_path, index=":", format="extxyz")
-        
+
         train_frames, train_E, train_F, train_pos = [], [], [], []
         if self.train_path and os.path.exists(self.train_path):
             train_E, train_F, train_pos = parse_extxyz(self.train_path, "training_data")
             train_frames = read(self.train_path, index=":", format="extxyz")
-            
+
             # Redundancy Purge
             eval_mask = []
             energy_tol, pos_tol = 0.0001, 0.0001
@@ -125,7 +128,7 @@ class DatasetManager:
                                 is_redundant = True
                                 break
                 eval_mask.append(not is_redundant)
-            
+
             val_frames = [f for f, k in zip(val_frames, eval_mask) if k]
             val_E = [e for e, k in zip(val_E, eval_mask) if k]
             val_F = [f for f, k in zip(val_F, eval_mask) if k]
@@ -161,69 +164,89 @@ class EnsembleRunner:
         self.ensemble_folder = self.eval_cfg.get("ensemble_folder")
         self.n_models = self.eval_cfg.get("ensemble_size", 1)
         self.batch_size = self.eval_cfg.get("batch_size", 32)
+        # Detect available GPUs
+        self.num_gpus = torch.cuda.device_count()
 
     def evaluate(self, frames, true_E=None, true_F=None, cache_file="ensemble_cache.npz"):
         if os.path.exists(cache_file):
             print(f"\n[EnsembleRunner] Loading cached predictions from {cache_file}...")
             data = np.load(cache_file, allow_pickle=True)
 
-            # --- FIX: Safely load ens_L_atom only if it exists in the cache ---
+            # Safely load ens_L_atom only if it exists in the cache
             ens_L_atom_cached = data["ens_L_atom"] if "ens_L_atom" in data else None
             return (data["ens_E"], data["ens_F"], data["ens_L_frame"], ens_L_atom_cached)
-            # ------------------------------------------------------------------
 
-        print(f"\n[EnsembleRunner] Inference for {len(frames)} frames across {self.n_models} models...")
+        print(f"\n[EnsembleRunner] Inference for {len(frames)} frames. Scanning for models...")
         ens_E, ens_F, ens_L_frame, ens_L_atom = [], [], [], []
+        avail_gpus = self.num_gpus if self.num_gpus > 0 else 1
 
-        for m_idx in range(self.n_models):
-            # Try both with and without the underscore before the number
-            base_paths = [
-                os.path.join(self.ensemble_folder, f"best_model_{m_idx+1}"),
-                os.path.join(self.ensemble_folder, f"best_model{m_idx+1}")
-            ]
+        # Dynamically scan for models based on extensions
+        valid_extensions = (".pth", ".pt", ".nequip.pth", ".model")
+        found_models = []
 
-            # Auto-detect extension
-            model_path = None
-            for base_path in base_paths:
-                # Prioritize .nequip.pth for your NequIP setup
-                for ext in [".nequip.pth", ".pth", ".pt", ""]:
-                    if os.path.exists(base_path + ext):
-                        model_path = base_path + ext
-                        break
-                if model_path:
-                    break
+        if os.path.exists(self.ensemble_folder):
+            for filename in sorted(os.listdir(self.ensemble_folder)):
+                if filename.endswith(valid_extensions):
+                    found_models.append(os.path.join(self.ensemble_folder, filename))
+        else:
+            print(f"[EnsembleRunner] ERROR: Ensemble folder '{self.ensemble_folder}' does not exist.")
 
-            if model_path is None:
-                print(f"     Failed to find model {m_idx+1}: {base_paths[0]}(.nequip.pth/.pth)")
-                continue
+        # Limit to the requested ensemble size
+        model_paths_to_run = found_models[:self.n_models]
 
-            print(f"  -> Model {m_idx+1}/{self.n_models}: {model_path}")
+        if not model_paths_to_run:
+             print(f"[EnsembleRunner] WARNING: No models found in {self.ensemble_folder} with extensions {valid_extensions}")
+
+        # Load and evaluate the found models
+        for m_idx, model_path in enumerate(model_paths_to_run):
+            
+            framework = self.config.get("model_framework", "schnetpack").lower()
+            
+            # --- MACE MULTI-GPU LOGIC ---
+            if framework == "mace":
+                target_gpu = torch.device(f"cuda:{m_idx % avail_gpus}") # Spread MACE across 4 GPUs
+            else:
+                target_gpu = torch.device("cuda:0") # NequIP, Allegro, SchNet, etc. stay on GPU 0
+                
+            print(f"  -> Loading Model {m_idx+1}/{len(model_paths_to_run)} sequentially on {target_gpu}: {os.path.basename(model_path)}")
+
             try:
-                if self.config.get("model_framework", "schnetpack").lower() == "nequip":
+                if framework in ["nequip", "allegro"]:
                     model_obj = model_path
                 else:
-                    model_obj = torch.load(model_path, map_location=self.device, weights_only=False)
+                    # Load onto CPU first, then transfer to target GPU
+                    model_obj = torch.load(model_path, map_location="cpu", weights_only=False)
+                    model_obj = model_obj.to(target_gpu)
+                    model_obj.eval()
             except Exception as e:
                 print(f"     Failed to load {model_path}: {e}")
                 continue
 
             preds_E, preds_F, preds_L_frame, preds_L_atom = evaluate_model(
                 frames=frames, true_energies=true_E, true_forces=true_F,
-                model_obj=model_obj, device=self.device, batch_size=self.batch_size,
+                model_obj=model_obj, device=target_gpu, batch_size=self.batch_size,
                 eval_log_file=None, config=self.config, neighbor_list=self.neighbor_list
             )
-            ens_E.append(preds_E)
-            ens_F.append(preds_F)
-            ens_L_frame.append(preds_L_frame)
-            ens_L_atom.append(preds_L_atom)
+
+            # Convert to numpy arrays immediately and optimize float precision
+            ens_E.append(np.array(preds_E, dtype=np.float32))
+            ens_F.append(np.array(preds_F, dtype=object))
+            ens_L_frame.append(np.array(preds_L_frame, dtype=np.float32))
+            ens_L_atom.append(None) # Omit massive atom latents to prevent System RAM OOM
+
+            # Memory cleanup
+            if framework not in ["nequip", "allegro"]:
+                del model_obj
+            torch.cuda.empty_cache()
+
+        if not ens_E:
+            return np.array([]), np.array([]), np.array([]), np.array([])
 
         ens_E = np.array(ens_E)
         ens_F = np.array(ens_F, dtype=object)
         ens_L_frame = np.array(ens_L_frame)
-        # We still collect ens_L_atom for memory return, but we won't save it
         ens_L_atom = np.array(ens_L_atom, dtype=object)
 
-        # --- FIX: Use uncompressed save and omit ens_L_atom ---
         print(f"[EnsembleRunner] Saving uncompressed cache to {cache_file} (omitting atom latents)...")
         np.savez(
             cache_file,
@@ -231,7 +254,6 @@ class EnsembleRunner:
             ens_F=ens_F,
             ens_L_frame=ens_L_frame
         )
-        # ------------------------------------------------------
         return ens_E, ens_F, ens_L_frame, ens_L_atom
 
 def plot_ensemble_histograms(mu_E, std_E, mu_F, std_F, out_dir="uq_plots"):
@@ -259,24 +281,24 @@ def _safe_load_model(model_path: str, device: torch.device, force_dtype=torch.fl
 
 class EvaluationPipeline:
     """Orchestrates the full MLFF evaluation and Active Learning pipeline."""
-    
+
     def __init__(self, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.eval_cfg = config.get("eval", {})
-        
+
         uq_methods = self.eval_cfg.get("uncertainty", ["none"])
         self.uq_methods = [uq_methods] if not isinstance(uq_methods, list) else uq_methods
-        
+
         # Directories & Logs
         os.makedirs("diagnostics", exist_ok=True)
         os.makedirs("uq_plots", exist_ok=True)
         self.eval_log = self.eval_cfg.get("eval_log_file", "eval_log.txt")
-        open(self.eval_log, "w").close() 
-        
+        open(self.eval_log, "w").close()
+
         self.neighbour_list = setup_neighbor_list(config)
         self.do_plot = self.eval_cfg.get("plot", False)
-        
+
         self.pool_xyz_path = self.eval_cfg.get("unlabeled_pool_path", None)
         self.al_val_flag = None if self.pool_xyz_path else self.eval_cfg.get("active_learning", None)
 
@@ -284,18 +306,18 @@ class EvaluationPipeline:
         # 1. Load Data
         data_mgr = DatasetManager(self.config)
         self.ds = data_mgr.load_datasets()
-        
+
         # 2. Evaluate Base Model (Single Model Fallback)
         if "none" in self.uq_methods or self.eval_cfg.get("error_estimate", False):
             self._run_base_model()
-            
+
         # 3. Evaluate Ensemble & Run Active Learning
         if "ensemble" in self.uq_methods:
             stats_ens, mean_L_frame, sigma_comp, sigma_E_raw = self._run_ensemble_labeled()
-            
+
             if self.al_val_flag and self.al_val_flag.lower() == "influence":
                 self._run_validation_al(stats_ens, mean_L_frame, sigma_comp)
-                
+
             if self.pool_xyz_path and os.path.exists(self.pool_xyz_path):
                 self._run_pool_al(stats_ens, mean_L_frame, sigma_E_raw, sigma_comp)
 
@@ -309,31 +331,31 @@ class EvaluationPipeline:
             return
 
         framework = self.config.get("model_framework", "schnetpack").lower()
-        if framework == "nequip":
+        if framework in ["nequip", "allegro"]:
             base_model = base_path
         else:
             base_model = _safe_load_model(base_path, device=self.device)
         print(f"Loaded base model from {base_path}")
-        
+
         pred_E, pred_F, _, _ = evaluate_model(
             self.ds["frames"], list(self.ds["E_true"]), self.ds["F_true"],
             base_model, self.device, self.eval_cfg.get("batch_size", 32),
             log_path=self.eval_log, config=self.config, neighbor_list=self.neighbour_list
         )
-        
+
         if isinstance(pred_F, np.ndarray) and pred_F.ndim == 3:
             pf_list, idx = [], 0
             for fr in self.ds["frames"]:
                 pf_list.append(pred_F[idx:idx+len(fr)])
                 idx += len(fr)
             pred_F = pf_list
-            
+
         stats_base = MLFFStats(self.ds["E_true"], pred_E, self.ds["F_true"], pred_F, self.ds["train_mask"], self.ds["val_mask"])
-        
+
         if "none" in self.uq_methods:
             print("\n--- Evaluating Base Model Performance ---")
             features_all, min_dists_all, _, _, _ = compute_features(
-                self.ds["frames"], self.config, self.eval_cfg.get("training_data"), 
+                self.ds["frames"], self.config, self.eval_cfg.get("training_data"),
                 self.ds["train_mask"], self.ds["val_mask"]
             )
             plot_mlff_stats(stats_base, min_dists_all, "validation_results_base", True, self.ds["train_mask"], self.ds["val_mask"])
@@ -344,9 +366,9 @@ class EvaluationPipeline:
         ens_E_sel, ens_F_list, ens_L_frame_sel, _ = runner.evaluate(
             self.ds["frames"], self.ds["E_true"], self.ds["F_true"], cache_file="ensemble.npz"
         )
-        
+
         ens_F_sel = np.array([np.concatenate(m_forces, axis=0) for m_forces in ens_F_list], dtype=float)
-        
+
         if ens_E_sel.shape[0] < 2:
             raise ValueError("Ensemble UQ requested, but fewer than 2 models were loaded.")
 
@@ -365,7 +387,7 @@ class EvaluationPipeline:
             mf_list.append(mu_F_comp[idx:idx+len(fr)])
             idx += len(fr)
         stats_ens = MLFFStats(self.ds["E_true"], mu_E_frame, self.ds["F_true"], mf_list, self.ds["train_mask"], self.ds["val_mask"])
-       
+
         sigma_comp = sigma_F_flat.flatten()
         sigma_atom = np.linalg.norm(sigma_comp.reshape(-1, 3), axis=1)
 
@@ -378,7 +400,7 @@ class EvaluationPipeline:
 
         metrics_train = calculate_uq_metrics(stats_ens, sigma_comp, sigma_atom, sigma_E_raw, "Train", "ensemble", self.eval_log)
         metrics_eval  = calculate_uq_metrics(stats_ens, sigma_comp, sigma_atom, sigma_E_raw, "Eval", "ensemble", self.eval_log)
-        
+
         if self.do_plot:
             generate_uq_plots(metrics_train["npz_path"], "Train", "error_model", calibration="var")
             generate_uq_plots(metrics_eval["npz_path"], "Eval", "error_model", calibration="var")
@@ -389,9 +411,9 @@ class EvaluationPipeline:
         """Active Learning on the validation set."""
         print("\n[Val-AL] Running Influence-based Active Learning on Validation Set...")
         _, sel_idx = adaptive_learning_ensemble_calibrated(
-            all_frames=self.ds["frames"], eval_mask=self.ds["val_mask"], 
-            delta_E_frame=stats_ens.delta_E_frame, mean_l_al=mean_L_frame, 
-            force_rmse_per_comp=sigma_comp, denom_all=self.ds["F_true"], 
+            all_frames=self.ds["frames"], eval_mask=self.ds["val_mask"],
+            delta_E_frame=stats_ens.delta_E_frame, mean_l_al=mean_L_frame,
+            force_rmse_per_comp=sigma_comp, denom_all=self.ds["F_true"],
             reference_frames=self.ds["val_frames_ref"], base="al_ens_val"
         )
 
@@ -400,7 +422,7 @@ class EvaluationPipeline:
             val_forces = np.stack([self.ds["F_true"][i] for i in sel_idx])
             val_energies = self.ds["E_true"][sel_idx]
             atom_types = self.ds["frames"][sel_idx[0]].get_chemical_symbols()
-            
+
             save_stacked_xyz_schnetpack("to_label_from_val.xyz", val_energies, val_pos, val_forces, atom_types)
             print(f"[Val-AL] Saved {len(sel_idx)} validation frames to 'to_label_from_val.xyz'.")
         else:
@@ -457,31 +479,25 @@ class EvaluationPipeline:
         df = pd.DataFrame({"mu": mu_E_pool, "sigma": sigma_E_pool})
         sm = df.rolling(50, center=True, min_periods=1).mean()
         bad_mask = np.zeros(len(mu_E_pool), dtype=bool)
-        
+
         # Calculate baseline diameter
         initial_pos = [pool_frames_thin[i].get_positions() for i in range(min(10, len(pool_frames_thin)))]
         max_diam = np.median([scipy.spatial.distance.pdist(p).max() for p in initial_pos]) * 1.5
 
         for k, orig_i in enumerate(thin_idx):
-            if not rdf_ok_mask[k]: 
+            if not rdf_ok_mask[k]:
                 bad_mask[orig_i] = True
             else:
                 diam = scipy.spatial.distance.pdist(pool_frames_thin[k].get_positions()).max()
                 if diam > max_diam:
                     bad_mask[orig_i] = True
-            
+
         np.savez_compressed("pool_energy_trace.npz", steps=np.arange(len(mu_E_pool)), mu=sm["mu"].values, sigma=sm["sigma"].values, bad=bad_mask)
 
-        # ---  SCRIPT FIX: Ensure F_train_thin is 2D for NequIP compatibility ---
-        F_train_2d = F_train_thin.reshape(-1, 1) if F_train_thin.ndim == 1 else F_train_thin
-        
-        good_rows = np.isfinite(F_train_2d).all(axis=1) & np.isfinite(stats_ens.delta_E_frame[self.ds["train_idx"]])
+        # Calibrations
+        good_rows = np.isfinite(F_train_thin).all(axis=1) & np.isfinite(stats_ens.delta_E_frame[self.ds["train_idx"]])
         print(f"[Pool-AL] Extracted {good_rows.sum()} valid training frames for GP calibration.")
-        
-        alpha_sq, _, _, _, L_chol = calibrate_alpha_reg_gcv(
-            F_train_2d[good_rows], 
-            stats_ens.delta_E_frame[self.ds["train_idx"]][good_rows]
-        )
+        alpha_sq, _, _, _, L_chol = calibrate_alpha_reg_gcv(F_train_thin[good_rows], stats_ens.delta_E_frame[self.ds["train_idx"]][good_rows])
 
         calibrator = UQCalibrator()
         mu_E_train = stats_ens.pred_energies[self.ds["train_idx"]]
@@ -491,7 +507,7 @@ class EvaluationPipeline:
         # Selection
         print("[Pool-AL] Running windowed active learning on thinned pool ...")
         _, sel_rel_thin = adaptive_learning_mig_pool_windowed(
-            pool_frames_thin, F_pool_thin, F_train_2d, alpha_sq, L_chol,
+            pool_frames_thin, F_pool_thin, F_train_thin, alpha_sq, L_chol,
             forces_train=self.ds["F_train_arr"], sigma_energy=sigma_E_raw, sigma_force=sigma_comp,
             mu_E_frame_train=mu_E_train, mu_E_pool=mu_E_pool_thin, sigma_E_pool=sigma_E_pool_thin,
             mu_F_pool=mu_F_pool_thin, sigma_F_pool=sigma_F_pool_thin, rdf_thresholds=rdf_thresholds,

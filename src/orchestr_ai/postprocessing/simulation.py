@@ -26,80 +26,19 @@ from ase.vibrations import Vibrations
 last_call_time = None
 cumulative_time = 0.0
 
-def get_ase_calculator(model, config, device, neighbor_list):
+def get_ase_calculator(model, config, device, neighbor_list=None):
     """Returns the official ASE calculator for the chosen ML framework."""
     framework = config.get("model_framework", "schnetpack").lower()
 
-    if framework == "schnetpack":
-        from schnetpack.interfaces import SpkCalculator
-        from ase.calculators.calculator import all_changes
-        import torch
+    if framework in {"schnet", "painn", "so3net", "field_schnet", "fusion"}:
+        framework = "schnetpack"
+        if neighbor_list is None:
+            raise ValueError(
+                "SchNetPack ASE calculator requires neighbor_list, "
+                "but neighbor_list=None was passed."
+            )
 
-        class LegacyOffsetSpkCalculator(SpkCalculator):
-            def __init__(self, model_obj, **kwargs):
-                self.mean_offset = 0.0
-                self.atomref = None
-                print("--- Attempting to surgically extract 'mean' and 'atomref' offsets ---")
-                try:
-                    if hasattr(model_obj, 'postprocessors'):
-                        for pp in model_obj.postprocessors:
-                            
-                            # 1. Aggressively extract mean
-                            extracted_mean = 0.0
-                            if hasattr(pp, 'state_dict') and 'mean' in pp.state_dict():
-                                extracted_mean = pp.state_dict()['mean'].item()
-                            elif hasattr(pp, 'mean') and isinstance(getattr(pp, 'mean'), torch.Tensor):
-                                extracted_mean = getattr(pp, 'mean').item()
-                            
-                            # 2. Flag and process the mean
-                            if abs(extracted_mean) > 1e-8:
-                                self.mean_offset = extracted_mean
-                                print(f"\n⚠️  FLAG: Non-zero dataset mean offset detected: {self.mean_offset:.6f} eV/atom")
-                                print("    -> The model was trained with 'remove_mean: true'.")
-                                print("    -> For optimal transferability, consider training future")
-                                print("       models with 'remove_mean: false'.\n")
-                            else:
-                                self.mean_offset = 0.0
-                                print("\n✅ FLAG: Mean offset is 0.0 (Trained with 'remove_mean: false').")
-                                print("    -> Model relies purely on isolated atomic energies.\n")
-                                
-                            # 3. Extract atomic references
-                            for ref_name in ['atomref', 'z_offsets']:
-                                if hasattr(pp, ref_name) and getattr(pp, ref_name) is not None:
-                                    ref_val = getattr(pp, ref_name)
-                                    if isinstance(ref_val, torch.Tensor):
-                                        self.atomref = ref_val.detach().cpu().numpy().astype(np.float64).flatten()
-                                    elif hasattr(ref_val, 'weight'):
-                                        self.atomref = ref_val.weight.detach().cpu().numpy().astype(np.float64).flatten()
-                                    print(f"Successfully extracted '{ref_name}' (isolated atomic energies).")
-                                    
-                        # Disable internal postprocessors 
-                        model_obj.postprocessors = torch.nn.ModuleList([])
-                        print("Successfully disabled model's internal postprocessors.")
-                except Exception as e:
-                     print(f"WARNING: Surgical extraction failed: {e}")
-                
-                super().__init__(model=model_obj, **kwargs)
-
-            def calculate(self, atoms=None, properties=['energy', 'forces'], system_changes=all_changes):
-                super().calculate(atoms, properties, system_changes)
-                
-                # Apply the surgical offset fix on-the-fly in float64
-                if 'energy' in self.results:
-                    total_offset = 0.0
-                    
-                    if self.atomref is not None:
-                        Z = self.atoms.numbers
-                        valid_Z = np.clip(Z, 0, len(self.atomref) - 1)
-                        total_offset += np.sum(self.atomref[valid_Z])
-                        
-                    if self.mean_offset != 0.0:
-                        total_offset += self.mean_offset * len(self.atoms)
-                        
-                    self.results['energy'] += total_offset
-                    
-                    if 'E_ml_avg' in self.results:
-                        self.results['E_ml_avg'] += total_offset
+        from orchestr_ai.postprocessing.calculators.schnetpack_ase import LegacyOffsetSpkCalculator
 
         # Return our newly wrapped calculator
         return LegacyOffsetSpkCalculator(
@@ -136,7 +75,7 @@ def get_ase_calculator(model, config, device, neighbor_list):
         # We pass the model inside a list as MACE expects for ensembles or single models.
         return MACECalculator(models=[model], device=str(device), default_dtype="float32")
 
-    elif framework == "nequip":
+    elif framework in {"nequip", "allegro"}:
         from nequip.ase import NequIPCalculator
         from ase.io import read
         try:
@@ -249,7 +188,7 @@ def log_vib_opt_status(optimizer, atoms, log_file, trajectory_file):
 
 # === Simulation Drivers ===
 
-def run_geo_opt(atoms, model_obj, device, neighbor_list, config):
+def run_geo_opt(atoms, model_obj, device, config, neighbor_list=None):
     """
     Runs geometry optimization using ASE's BFGSLineSearch optimizer.
 
@@ -389,7 +328,7 @@ def print_md_status(
 
 
 
-def run_md(atoms, model_obj, device, neighbor_list, config):
+def run_md(atoms, model_obj, device, config, neighbor_list=None):
     """Top-level MD driver with tidy, non-overlapping callbacks."""
 
     md            = config["md"]
@@ -398,32 +337,85 @@ def run_md(atoms, model_obj, device, neighbor_list, config):
     log_int       = md.get("log_interval",     5)
     xyz_int       = md.get("xyz_print_interval", 50)
     T0            = md.get("temperature_K",    300.0)
-    use_langevin  = md.get("use_langevin",     True)
     traj_file     = md.get("trajectory_file_md")
     log_file      = md.get("log_file")
 
     # -----------------------------------------------------------------
-    #  calculator + starting velocities
+    #  calculator + starting velocities (preventing zero kinetic energy)
     # -----------------------------------------------------------------
     calc = get_ase_calculator(model_obj, config, device, neighbor_list)
     atoms.calc = calc
-    MaxwellBoltzmannDistribution(atoms, temperature_K=T0/8)
+
+    heating_steps = md.get("heating_steps", 0)
+    T_start = md.get("heating_T_start", 10.0)
+
+    if heating_steps > 0:
+        print(f"Heating initialized: starting at {T_start} K, ramping to {T0} K over {heating_steps} steps.")
+        MaxwellBoltzmannDistribution(atoms, temperature_K=T_start)
+    else:
+        print(f"No heating ramp: starting at target temperature {T0} K.")
+        MaxwellBoltzmannDistribution(atoms, temperature_K=T0)
 
     # -----------------------------------------------------------------
-    #  choose integrator
+    #  choose integrator (thermostat)
     # -----------------------------------------------------------------
-    if use_langevin:
-        gamma_fs      = md.get("friction_coefficient", 0.01)
+    thermostat = md.get("thermostat", "langevin").lower()
+    if "thermostat" not in md and "use_langevin" in md:
+        thermostat = "langevin" if md.get("use_langevin") else "verlet"
+
+    if thermostat in {"bussi", "csvr"}:
+        from ase.md.bussi import Bussi
+        taut_fs = md.get("taut_fs", 100.0)
+        dyn = Bussi(
+            atoms,
+            timestep      = dt_fs * units.fs,
+            temperature_K = T0,
+            taut          = taut_fs * units.fs,
+        )
+        dyn.temperature_K = T0
+        gamma_fs = 0.0  # not Langevin, no friction logging
+        thermostat_desc = f"Bussi/CSVR τ = {taut_fs} fs"
+    elif thermostat == "langevin":
+        gamma_fs = md.get("friction_coefficient", 0.01)
         dyn = Langevin(
             atoms,
-            timestep   = dt_fs * units.fs,
+            timestep      = dt_fs * units.fs,
             temperature_K = T0,
-            friction   = gamma_fs,
+            friction      = gamma_fs,
         )
+        dyn.temperature_K = T0
+        thermostat_desc = f"Langevin γ = {gamma_fs}"
     else:
         from ase.md.verlet import VelocityVerlet
         dyn = VelocityVerlet(atoms, timestep = dt_fs * units.fs)
-        gamma_fs = 0.0                                 # for logging
+        dyn.temperature_K = np.nan
+        gamma_fs = 0.0
+        thermostat_desc = "VelocityVerlet"
+
+    # -----------------------------------------------------------------
+    #  temperature heating ramp callback
+    # -----------------------------------------------------------------
+    if heating_steps > 0:
+        def ramp_callback():
+            step = dyn.get_number_of_steps()
+            if step <= heating_steps:
+                current_T = T_start + (T0 - T_start) * (step / heating_steps)
+            else:
+                current_T = T0
+
+            # Set temperature on thermostat
+            if hasattr(dyn, "set_temperature"):
+                dyn.set_temperature(temperature_K=current_T)
+            elif hasattr(dyn, "temp"):
+                dyn.temp = current_T * units.kB
+                if hasattr(dyn, "ndof"):
+                    dyn.target_kinetic_energy = 0.5 * dyn.temp * dyn.ndof
+            
+            dyn.temperature_K = current_T
+
+        dyn.attach(ramp_callback, interval=1)
+        # Execute once at step 0 to ensure initialization starts at T_start
+        ramp_callback()
 
     # -----------------------------------------------------------------
     #  callbacks
@@ -452,13 +444,13 @@ def run_md(atoms, model_obj, device, neighbor_list, config):
     # -----------------------------------------------------------------
     #  run!
     # -----------------------------------------------------------------
-    print(f"Running MD: {nsteps} steps · Δt = {dt_fs} fs · thermostat = {('Langevin γ = %.5f' % gamma_fs) if use_langevin else 'VelocityVerlet'}")
+    print(f"Running MD: {nsteps} steps · Δt = {dt_fs} fs · thermostat = {thermostat_desc}")
     dyn.run(nsteps)
     print("MD finished.")
 
 
 
-def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
+def run_vibrational_analysis(atoms, model_obj, device, config, neighbor_list=None):
     """
     Runs vibrational analysis, including tight geometry optimization and frequency calculation.
 
@@ -610,4 +602,3 @@ def run_vibrational_analysis(atoms, model_obj, device, neighbor_list, config):
         traceback.print_exc() # Print traceback for VDOS errors
 
     return frequencies_cm
-

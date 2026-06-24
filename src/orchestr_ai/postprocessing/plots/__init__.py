@@ -1,8 +1,4 @@
-"""Plotting utilities compatibility layer.
-
-This module re-exports the plotting functions which have been moved to the `plots` sub-package.
-"""
-from .plots.utils import (
+from .utils import (
     plot_scalar_metrics,
     plot_coverage_curve,
     plot_sigma_density,
@@ -11,8 +7,8 @@ from .plots.utils import (
     plot_swapped_final_tight,
     plot_original_final_tight,
 )
-from .plots.uq import generate_uq_plots
-from .plots.active_learning import (
+from .uq import generate_uq_plots
+from .active_learning import (
     plot_histogram,
     plot_overall_score_vs_clusters,
     plot_rmse_vs_sorted_overall_score,
@@ -20,7 +16,7 @@ from .plots.active_learning import (
     generate_al_influence_plots,
     generate_al_traditional_plots,
 )
-from .plots.mlff import plot_mlff_stats
+from .mlff import plot_mlff_stats
 
 __all__ = [
     "plot_scalar_metrics",
